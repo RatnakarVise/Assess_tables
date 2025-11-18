@@ -1,14 +1,14 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from pathlib import Path
 import json
 import re
-from pathlib import Path
 
 # ---------------------------------------------------------------------
 # APP INIT
 # ---------------------------------------------------------------------
-app = FastAPI(title="Dynamic SAP Table Replacement Scanner (Final Enhanced Version)")
+app = FastAPI(title="Legacy Table Scanner (Refactored Version)")
 
 
 # ---------------------------------------------------------------------
@@ -17,35 +17,32 @@ app = FastAPI(title="Dynamic SAP Table Replacement Scanner (Final Enhanced Versi
 MAPPING_PATH = Path(__file__).parent / "tables.json"
 
 with open(MAPPING_PATH, "r", encoding="utf-8") as f:
-    TABLE_MAP = json.load(f)
+    TABLE_MAP: Dict[str, str] = json.load(f)
 
 OLD_TABLES = list(TABLE_MAP.keys())
 
-# Build dynamic regex table list
-TBL_GROUP = "|".join(sorted(OLD_TABLES, key=len, reverse=True))
+# Build dynamic regex-safe table list
+TBL_GROUP = "|".join(sorted(map(re.escape, OLD_TABLES), key=len, reverse=True))
 
 
 # ---------------------------------------------------------------------
 # REGEX DEFINITIONS
 # ---------------------------------------------------------------------
-REGEX = {
+REGEX: Dict[str, re.Pattern] = {
     "DML": re.compile(
         rf"(?P<full>(?P<stmt>\bSELECT\b|\bINSERT\b|\bUPDATE\b|\bDELETE\b|\bMODIFY\b)"
         rf"[\s\S]*?\b(FROM|INTO|UPDATE|DELETE\s+FROM)\b\s+(?P<obj>{TBL_GROUP})\b)",
         re.IGNORECASE,
     ),
-
     "CLEAR": re.compile(
         rf"(?P<full>\bCLEAR\b\s+(?P<obj>{TBL_GROUP})\b[\w\-]*)",
         re.IGNORECASE,
     ),
-
     "ASSIGN": re.compile(
         rf"(?P<full>((?P<obj>{TBL_GROUP})[\w\-]*\s*=\s*[\w\-\>]+"
         rf"|[\w\-\>]+\s*=\s*(?P<obj2>{TBL_GROUP})[\w\-]*))",
         re.IGNORECASE,
     ),
-
     "GENERIC": re.compile(
         rf"(?P<full>\b(?P<obj>{TBL_GROUP})\b)",
         re.IGNORECASE,
@@ -54,7 +51,7 @@ REGEX = {
 
 
 # ---------------------------------------------------------------------
-# Input Pydantic Model
+# PAYLOAD MODEL
 # ---------------------------------------------------------------------
 class Unit(BaseModel):
     pgm_name: str
@@ -62,131 +59,193 @@ class Unit(BaseModel):
     type: str
     name: Optional[str] = None
     class_implementation: Optional[str] = None
-    start_line: Optional[int] = None  # absolute start in full program
+    start_line: Optional[int] = None
     end_line: Optional[int] = None
     code: Optional[str] = ""
 
 
 # ---------------------------------------------------------------------
-# SNIPPET EXTRACTION
+# RESPONSE MODEL
 # ---------------------------------------------------------------------
-def snippet_at(text: str, start: int, end: int) -> str:
-    s = max(0, start - 60)
-    e = min(len(text), end + 60)
-    return text[s:e].replace("\n", "\\n")
+class Issue(BaseModel):
+    pgm_name: Optional[str] = None
+    inc_name: Optional[str] = None
+    type: Optional[str] = None
+    name: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    issue_type: Optional[str] = None   # "DirectRead" | "DisallowedWrite"
+    severity: Optional[str] = None     # "info" | "warning" | "error"
+    message: Optional[str] = None
+    suggestion: Optional[str] = None
+    snippet: Optional[str] = None
 
 
 # ---------------------------------------------------------------------
-# MULTI-LINE SUPPORT HELPERS
+# HELPER: GET FULL LINE SNIPPET FOR A MATCH
 # ---------------------------------------------------------------------
-def get_line_and_column(text: str, index: int):
+def get_line_snippet(text: str, start: int, end: int) -> str:
     """
-    Given a character index, return:
-    - line number (1-based)
-    - column number (1-based)
+    Given a match span (start, end), return the full line in which
+    that match occurs (no extra lines).
     """
-    line = text.count("\n", 0, index) + 1
-    last_newline = text.rfind("\n", 0, index)
-    col = index - (last_newline + 1)
-    return line, col + 1
+    line_start = text.rfind("\n", 0, start)
+    if line_start == -1:
+        line_start = 0
+    else:
+        line_start += 1  # right after the '\n'
+
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+
+    return text[line_start:line_end]
 
 
 # ---------------------------------------------------------------------
-# MAIN FINDER — returns ALL table usages
+# HELPER: CLASSIFY ISSUE (issue_type, severity, message, suggestion)
 # ---------------------------------------------------------------------
-def find_table_usage(txt: str):
-    matches = []
-    seen = set()
+def classify_issue(
+    pattern_name: str,
+    stmt: Optional[str],
+    table_name: str,
+    replacement: Optional[str],
+) -> Dict[str, str]:
+    stmt_upper = (stmt or "").upper()
 
-    for name, pattern in REGEX.items():
+    # Determine issue type & severity
+    if pattern_name == "DML":
+        if stmt_upper == "SELECT":
+            issue_type = "DirectRead"
+            severity = "warning"
+        else:
+            # INSERT / UPDATE / DELETE / MODIFY
+            issue_type = "DisallowedWrite"
+            severity = "error"
+    else:
+        # CLEAR, ASSIGN, GENERIC – treat as direct access
+        issue_type = "DirectRead"
+        severity = "info"
+
+    # Message & suggestion
+    if replacement:
+        message = f"Legacy table {table_name} is used in a {pattern_name} statement."
+        suggestion = f"Use {replacement} instead of {table_name}."
+    else:
+        message = f"Legacy table {table_name} is used but no replacement mapping is defined."
+        suggestion = (
+            "Add an entry in tables.json for this table or refactor to a supported object."
+        )
+
+    return {
+        "issue_type": issue_type,
+        "severity": severity,
+        "message": message,
+        "suggestion": suggestion,
+    }
+
+
+# ---------------------------------------------------------------------
+# CORE SCANNER: FIND ALL TABLE USAGES IN A SINGLE CODE STRING
+# ---------------------------------------------------------------------
+def find_table_usage(txt: str) -> List[Dict[str, Any]]:
+    """
+    Runs all regexes over the given text and returns a list of matches.
+    Each match contains:
+      - pattern: which regex matched (DML / CLEAR / ASSIGN / GENERIC)
+      - stmt: statement keyword (for DML)
+      - object: table name
+      - replacement_table: mapped new table (if any)
+      - span: (start_char, end_char)
+    """
+    matches: List[Dict[str, Any]] = []
+    seen = set()  # avoid duplicates (table, line_no)
+
+    for pattern_name, pattern in REGEX.items():
         for m in pattern.finditer(txt or ""):
-
-            obj = m.groupdict().get("obj") or m.groupdict().get("obj2")
+            gd = m.groupdict()
+            obj = gd.get("obj") or gd.get("obj2")
             if not obj:
                 continue
 
             start, end = m.span("full")
 
-            # 1️⃣ relative line numbers inside snippet
-            start_rel_line, start_rel_col = get_line_and_column(txt, start)
-            end_rel_line, end_rel_col = get_line_and_column(txt, end)
-
-            # Deduplicate by (table, starting line)
-            key = (obj, start_rel_line)
+            # Dedup by (table_name, line number)
+            line_no = txt[:start].count("\n") + 1
+            key = (obj, line_no, pattern_name)
             if key in seen:
                 continue
             seen.add(key)
 
+            stmt = gd.get("stmt")
             replacement = TABLE_MAP.get(obj.upper())
 
-            matches.append({
-                "full": m.group("full"),
-                "stmt": m.groupdict().get("stmt") or "=",
-                "object": obj,
-                "replacement_table": replacement,
-                "ambiguous": replacement is None,
-                "suggested_statement": (
-                    f"Replace {obj} with {replacement}" if replacement else None
-                ),
-                "span": (start, end),
+            matches.append(
+                {
+                    "pattern": pattern_name,
+                    "full": m.group("full"),
+                    "stmt": stmt,
+                    "object": obj,
+                    "replacement_table": replacement,
+                    "span": (start, end),
+                }
+            )
 
-                # MULTI-LINE SUPPORT
-                "relative_start_line": start_rel_line,
-                "relative_end_line": end_rel_line,
-                "relative_start_col": start_rel_col,
-                "relative_end_col": end_rel_col,
-            })
-
+    # sort by where they appear in the code
     matches.sort(key=lambda x: x["span"][0])
     return matches
 
 
 # ---------------------------------------------------------------------
 # API: /remediate-tables
+# (same endpoint name, new response structure)
 # ---------------------------------------------------------------------
-@app.post("/remediate-tables")
-def remediate_tables(units: List[Unit]):
-    results = []
+@app.post("/remediate-tables", response_model=List[Issue])
+def remediate_tables(units: List[Unit]) -> List[Issue]:
+    all_issues: List[Issue] = []
 
     for u in units:
         src = u.code or ""
-        metadata = []
+        base_start = u.start_line or 0
 
         for m in find_table_usage(src):
-
-            # convert relative → absolute program line numbers
-            abs_start_line = u.start_line + (m["relative_start_line"] - 1)
-            abs_end_line = u.start_line + (m["relative_end_line"] - 1)
-
             start, end = m["span"]
 
-            metadata.append({
-                "table": m["object"],
-                "target_type": "TABLE",
-                "target_name": m["object"],
+            # Compute line offset inside this block
+            line_in_block = src[:start].count("\n") + 1
 
-                # CHARACTER index inside snippet
-                "start_char_in_unit": start,
-                "end_char_in_unit": end,
+            # Snippet = full line containing the match
+            snippet_text = get_line_snippet(src, start, end)
+            snippet_line_count = snippet_text.count("\n") + 1  # mostly 1
 
-                # FINAL → MULTI-LINE ABSOLUTE LOCATION
-                "start_line": abs_start_line,
-                "end_line": abs_end_line,
-                "line_span": [abs_start_line, abs_end_line],
+            # Absolute line numbers (following your original rule)
+            start_line_abs = base_start + line_in_block
+            end_line_abs = base_start + line_in_block + snippet_line_count
 
-                # COLUMN NUMBERS
-                "start_column": m["relative_start_col"],
-                "end_column": m["relative_end_col"],
+            # Classify issue
+            table_name = m["object"]
+            replacement = m["replacement_table"]
+            stmt = m.get("stmt")
+            issue_meta = classify_issue(
+                pattern_name=m["pattern"],
+                stmt=stmt,
+                table_name=table_name,
+                replacement=replacement,
+            )
 
-                "used_fields": [],
-                "ambiguous": m["ambiguous"],
-                "suggested_statement": m["suggested_statement"],
-                "new_table": m["replacement_table"],
-                "snippet": snippet_at(src, start, end),
-            })
+            issue = Issue(
+                pgm_name=u.pgm_name,
+                inc_name=u.inc_name,
+                type=u.type,
+                name=u.name,
+                start_line=start_line_abs,
+                end_line=end_line_abs,
+                issue_type=issue_meta["issue_type"],
+                severity=issue_meta["severity"],
+                message=issue_meta["message"],
+                suggestion=issue_meta["suggestion"],
+                snippet=snippet_text.replace("\n", "\\n"),
+            )
+            all_issues.append(issue)
 
-        obj = json.loads(u.model_dump_json())
-        obj["table_replacements"] = metadata
-        results.append(obj)
-
-    return results
+    return all_issues
