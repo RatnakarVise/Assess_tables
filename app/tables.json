@@ -1,9 +1,47 @@
 {
   "S066": "UKM_ITEM",
   "S067": "UKM_ITEM",
+
   "BSID": "ACDOCA",
   "BSAD": "ACDOCA",
-  "LIPS": "I_SDDeliveryItem",
+  "BSIK": "ACDOCA",
+  "BSOK": "ACDOCA",
+  "BSET": "ACDOCA",
+
   "BKPF": "ACDOCU",
-  "BSEG": "ACDOCU"
+  "BSEG": "ACDOCU",
+  "BSIS": "ACDOCU",
+  "BSAS": "ACDOCU",
+
+  "LIPS": "I_SDDeliveryItem",
+  "LIKP": "I_SDDeliveryDocument",
+
+  "VBRP": "I_BillingDocumentItem",
+  "VBRK": "I_BillingDocument",
+
+  "VBAK": "I_SalesDocument",
+  "VBAP": "I_SalesDocumentItem",
+
+  "EKPO": "I_PurchaseOrderItem",
+  "EKKO": "I_PurchaseOrder",
+
+  "MARA": "I_ProductBasic",
+  "MARC": "I_MaterialPlant",
+  "MARD": "I_StorageLocationStock",
+
+  "MKPF": "I_MaterialDocument",
+  "MSEG": "I_MaterialDocumentItem",
+
+  "ANLA": "I_AssetMasterFixedAsset",
+  "ANLB": "I_AssetMasterDepreciationArea",
+
+  "CE1XXXX": "ACDOCA",
+  "CE2XXXX": "ACDOCA",
+
+  "GLT0": "ACDOCA",
+  "COSS": "ACDOCA",
+  "COSL": "ACDOCA",
+
+  "KNA1": "I_Customer",
+  "LFA1": "I_Supplier"
 }
